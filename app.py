@@ -6,7 +6,11 @@ Evolution app for Big Data
     streamlit run app.py
 """
 
+import glob
 import os
+import socket
+import sys
+import time
 from collections import deque
 from pathlib import Path
 
@@ -16,6 +20,8 @@ import streamlit as st
 DATA_DIR = Path(os.environ.get("BIGDATA_DIR", r"C:\bigdata")) / "data"
 RANKS_CSV = DATA_DIR.parent / "lookup" / "ranks.csv"
 MAX_CHILDREN_SHOWN = 8
+SPARK_MASTER = os.environ.get("SPARK_MASTER", "spark://172.20.10.3:7077")
+DRIVER_HOST = os.environ.get("DRIVER_HOST", "172.20.10.3")
 ENTITY = "http://www.wikidata.org/entity/"
 RANK_NAMES = {"Q7432": "species", "Q68947": "subspecies", "Q34740": "genus",
               "Q35409": "family", "Q36602": "order", "Q37517": "class"}
@@ -23,66 +29,129 @@ RANK_NAMES = {"Q7432": "species", "Q68947": "subspecies", "Q34740": "genus",
 st.set_page_config(page_title="Animal Lineage Explorer", page_icon="🌳", layout="wide")
 
 
-@st.cache_data
-def load_raw():
-    frames = []
-    for f in sorted(DATA_DIR.glob("*.csv")):
-        d = pd.read_csv(f, dtype=str)
-        d["dataset"] = f.stem
-        frames.append(d)
-    raw = pd.concat(frames, ignore_index=True)
-    for c in ["taxon", "parent", "rank"]:
-        if c in raw:
-            raw[c] = raw[c].str.replace(ENTITY, "", regex=False)
-    return raw
+def import_pyspark():
+    try:
+        import pyspark
+    except ImportError:
+        home = os.environ["SPARK_HOME"]
+        sys.path.insert(0, os.path.join(home, "python"))
+        sys.path.insert(0, glob.glob(os.path.join(home, "python", "lib", "py4j-*.zip"))[0])
+    from pyspark.sql import SparkSession, functions as F
+    return SparkSession, F
 
 
-@st.cache_data
-def load_taxa(raw):
+@st.cache_resource
+def get_spark():
+    SparkSession, _ = import_pyspark()
+    builder = (SparkSession.builder.appName("AnimalLineageApp")
+               .master(SPARK_MASTER)
+               .config("spark.sql.shuffle.partitions", "8"))
+    if SPARK_MASTER.startswith("spark://"):
+        builder = builder.config("spark.driver.host", DRIVER_HOST)
+    spark = builder.getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+
+def rank_names():
     names = dict(RANK_NAMES)
     if RANKS_CSV.exists():
         r = pd.read_csv(RANKS_CSV, dtype=str)
         names.update(dict(zip(r["rank"].str.replace(ENTITY, "", regex=False), r["rankLabel"])))
+    return names
 
-    df = (raw[raw["parent"].isna() | (raw["taxon"] != raw["parent"])]
-          .sort_values(["taxon", "parent", "commonName"], na_position="last")
-          .groupby("taxon", as_index=False).first())
-    df["rank"] = df["rank"].map(lambda x: names.get(x, x) if isinstance(x, str) else "unranked")
-    df["commonName"] = df["commonName"].fillna("")
 
-    parent = dict(zip(df["taxon"], df["parent"]))
-    known = set(parent)
-    paths = {}
+@st.cache_data(show_spinner=False)
+def compute_with_spark():
+    t0 = time.time()
+    spark = get_spark()
+    _, F = import_pyspark()
 
-    def lineage(t):
-        if t in paths:
-            return paths[t]
-        chain, seen = [], set()
-        cur = t
-        while cur in known and cur not in seen:
-            if cur in paths:
-                chain.extend(paths[cur])
-                break
-            seen.add(cur)
-            chain.append(cur)
-            cur = parent.get(cur)
-        paths[t] = chain
-        return chain
+    raw = (spark.read.csv(DATA_DIR.as_uri() + "/*.csv", header=True)
+           .withColumn("dataset", F.regexp_extract(F.input_file_name(), r"([^/\\]+)\.csv$", 1)))
+    for c in ["taxon", "parent", "rank"]:
+        raw = raw.withColumn(c, F.regexp_replace(c, ENTITY, ""))
+    raw = raw.repartition(8).cache()
+    hosts = raw.rdd.mapPartitions(lambda _: [socket.gethostname()]).distinct().collect()
 
-    df["path"] = df["taxon"].map(lineage)
-    df["depth"] = df["path"].str.len() - 1
+    n_raw = raw.count()
+    per = raw.groupBy("taxon").agg(
+        F.countDistinct("parent").alias("parents"),
+        F.countDistinct("commonName").alias("names"),
+        F.count("rank").alias("rank"),
+        F.count("parent").alias("parent_any"),
+        F.count("commonName").alias("common"),
+        F.max((F.col("taxon") == F.col("parent")).cast("int")).alias("self_parent"),
+    ).cache()
+    n_distinct = per.count()
+    report = pd.DataFrame([
+        ("Raw rows", n_raw),
+        ("Distinct taxa", n_distinct),
+        ("Duplicate rows removed", n_raw - n_distinct),
+        ("Taxa with 2+ parents (conflicting classification)", per.filter("parents > 1").count()),
+        ("Taxa with 2+ English common names", per.filter("names > 1").count()),
+        ("Taxa missing rank", per.filter("rank = 0").count()),
+        ("Taxa missing parent", per.filter("parent_any = 0").count()),
+        ("Taxa missing English common name", per.filter("common = 0").count()),
+        ("Taxa listed as their own parent", per.filter("self_parent = 1").count()),
+    ], columns=["check", "count"])
 
-    rank_of = dict(zip(df["taxon"], df["rank"]))
-    name_of = dict(zip(df["taxon"], df["name"]))
+    rmap = F.create_map([F.lit(x) for pair in rank_names().items() for x in pair])
+    clean = (raw.filter(F.col("parent").isNull() | (F.col("taxon") != F.col("parent")))
+             .groupBy("taxon").agg(
+                 F.first("name", ignorenulls=True).alias("name"),
+                 F.first("rank", ignorenulls=True).alias("rank_id"),
+                 F.min("parent").alias("parent"),
+                 F.min("commonName").alias("commonName"),
+                 F.first("dataset").alias("dataset"))
+             .withColumn("rank", F.coalesce(rmap[F.col("rank_id")], F.col("rank_id"), F.lit("unranked")))
+             .drop("rank_id").cache())
 
-    def first_with_rank(path, rank):
-        return next((name_of[t] for t in path if rank_of.get(t) == rank), None)
+    nodes = clean.select(F.col("taxon").alias("n_taxon"), F.col("parent").alias("n_parent"))
+    lin = clean.select("taxon", F.array("taxon").alias("path"), F.col("parent").alias("cur"))
+    rounds = 0
+    for _ in range(60):
+        rounds += 1
+        j = lin.join(nodes, lin.cur == nodes.n_taxon, "left")
+        ok = F.col("n_taxon").isNotNull() & ~F.array_contains("path", F.col("cur"))
+        lin = j.select(
+            "taxon",
+            F.when(ok, F.concat("path", F.array("cur"))).otherwise(F.col("path")).alias("path"),
+            F.when(ok, F.col("n_parent")).alias("cur"),
+        ).localCheckpoint()
+        if lin.filter(F.col("cur").isNotNull()).count() == 0:
+            break
 
-    df["order"] = df["path"].map(lambda p: first_with_rank(p, "order"))
-    df["family"] = df["path"].map(lambda p: first_with_rank(p, "family"))
-    df["_name_lc"] = df["name"].str.lower()
-    df["_common_lc"] = df["commonName"].str.lower()
-    return df
+    lineage = lin.select("taxon", "path", (F.size("path") - 1).alias("depth")).join(clean, "taxon")
+    ranked = (lineage.select("taxon", F.explode("path").alias("ancestor"))
+              .join(clean.select(F.col("taxon").alias("ancestor"), F.col("rank").alias("a_rank"),
+                                 F.col("name").alias("a_name")), "ancestor"))
+    groups = ranked.groupBy("taxon").agg(
+        F.first(F.when(F.col("a_rank") == "order", F.col("a_name")), ignorenulls=True).alias("order"),
+        F.first(F.when(F.col("a_rank") == "family", F.col("a_name")), ignorenulls=True).alias("family"),
+    )
+    full = lineage.join(groups, "taxon", "left").cache()
+    species = full.filter(F.col("rank") == "species")
+    analysis = {
+        "per_order": species.groupBy("dataset", "order").count().toPandas(),
+        "per_family": species.groupBy("family").count().toPandas(),
+        "by_rank": full.groupBy("rank").count().toPandas(),
+        "coverage": species.groupBy("dataset").agg(
+            F.count("*").alias("species"),
+            F.round(100 * F.avg((F.col("commonName").isNotNull()).cast("int")), 1).alias("pct_with_common_name"),
+            F.round(F.avg("depth"), 1).alias("avg_lineage_depth"),
+            F.max("depth").alias("max_lineage_depth"),
+        ).toPandas(),
+    }
+    taxa = full.toPandas()
+
+    taxa["path"] = taxa["path"].map(list)
+    taxa["commonName"] = taxa["commonName"].fillna("")
+    taxa["_name_lc"] = taxa["name"].str.lower()
+    taxa["_common_lc"] = taxa["commonName"].str.lower()
+    stats = {"hosts": sorted(hosts), "seconds": round(time.time() - t0, 1), "rounds": rounds,
+             "master": SPARK_MASTER}
+    return taxa, report, analysis, stats
 
 
 @st.cache_data
@@ -90,23 +159,6 @@ def build_index(_df):
     info = _df.set_index("taxon")[["name", "commonName", "rank", "parent", "depth"]].to_dict("index")
     children = _df.dropna(subset=["parent"]).groupby("parent")["taxon"].apply(list).to_dict()
     return info, children
-
-
-def quality_report(raw):
-    per = raw.groupby("taxon").agg(rows=("taxon", "size"), parents=("parent", "nunique"),
-                                   names=("commonName", "nunique"), rank=("rank", "count"),
-                                   parent_any=("parent", "count"), common=("commonName", "count"))
-    return pd.DataFrame([
-        ("Raw rows", len(raw)),
-        ("Distinct taxa", len(per)),
-        ("Duplicate rows removed", len(raw) - len(per)),
-        ("Taxa with 2+ parents (conflicting classification)", int((per["parents"] > 1).sum())),
-        ("Taxa with 2+ English common names", int((per["names"] > 1).sum())),
-        ("Taxa missing rank", int((per["rank"] == 0).sum())),
-        ("Taxa missing parent", int((per["parent_any"] == 0).sum())),
-        ("Taxa missing English common name", int((per["common"] == 0).sum())),
-        ("Taxa listed as their own parent", int((raw["taxon"] == raw["parent"]).groupby(raw["taxon"]).any().sum())),
-    ], columns=["check", "count"])
 
 
 def search(df, text, limit=50):
@@ -199,12 +251,23 @@ if not list(DATA_DIR.glob("*.csv")):
     st.error(f"No CSV files in {DATA_DIR}. Download them from query.wikidata.org first.")
     st.stop()
 
-raw = load_raw()
-taxa = load_taxa(raw)
+with st.spinner(f"Spark is processing the data on {SPARK_MASTER} ..."):
+    taxa, report, analysis, stats = compute_with_spark()
 info, children = build_index(taxa)
 
+with st.sidebar:
+    st.subheader("Spark cluster")
+    st.markdown(f"Master: `{stats['master']}`")
+    st.markdown("Machines that processed data:")
+    for h in stats["hosts"]:
+        st.markdown(f"- `{h}`")
+    st.markdown(f"Lineage rounds: `{stats['rounds']}`  \nProcessing time: `{stats['seconds']} s`")
+    if st.button("Recompute on cluster"):
+        compute_with_spark.clear()
+        st.rerun()
+
 st.title("🌳 Animal Lineage Explorer")
-st.caption(f"{len(taxa):,} taxa from Wikidata, read straight from the downloaded CSVs")
+st.caption(f"{len(taxa):,} taxa from Wikidata, processed on a PySpark cluster")
 
 tab_tree, tab_value, tab_quality = st.tabs(["Lineage explorer", "Analysis", "Data quality"])
 
@@ -255,16 +318,10 @@ with tab_tree:
 
 
 with tab_value:
-    species = taxa[taxa["rank"] == "species"]
-    per_order = species.groupby(["dataset", "order"]).size().reset_index(name="count")
-    per_family = species.groupby("family").size().reset_index(name="count")
-    by_rank = taxa.groupby("rank").size().reset_index(name="count")
-    coverage = species.groupby("dataset").agg(
-        species=("taxon", "size"),
-        pct_with_common_name=("commonName", lambda s: round(100 * (s != "").mean(), 1)),
-        avg_lineage_depth=("depth", lambda s: round(s.mean(), 1)),
-        max_lineage_depth=("depth", "max"),
-    ).reset_index()
+    per_order = analysis["per_order"]
+    per_family = analysis["per_family"]
+    by_rank = analysis["by_rank"]
+    coverage = analysis["coverage"]
 
     c1, c2 = st.columns(2)
     with c1:
@@ -293,7 +350,6 @@ with tab_value:
 
 
 with tab_quality:
-    report = quality_report(raw)
     st.subheader("Problems found in the raw data (Veracity)")
     n_raw = int(report.loc[report["check"] == "Raw rows", "count"].iloc[0])
     n_distinct = int(report.loc[report["check"] == "Distinct taxa", "count"].iloc[0])
