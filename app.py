@@ -20,8 +20,6 @@ import streamlit as st
 DATA_DIR = Path(os.environ.get("BIGDATA_DIR", r"C:\bigdata")) / "data"
 RANKS_CSV = DATA_DIR.parent / "lookup" / "ranks.csv"
 MAX_CHILDREN_SHOWN = 8
-SPARK_MASTER = os.environ.get("SPARK_MASTER", "spark://172.20.10.3:7077")
-DRIVER_HOST = os.environ.get("DRIVER_HOST", "172.20.10.3")
 ENTITY = "http://www.wikidata.org/entity/"
 RANK_NAMES = {"Q7432": "species", "Q68947": "subspecies", "Q34740": "genus",
               "Q35409": "family", "Q36602": "order", "Q37517": "class"}
@@ -40,6 +38,35 @@ def import_pyspark():
     return SparkSession, F
 
 
+def clean_master_url(url):
+    url = url.strip().strip('"').rstrip("/")
+    if not url.startswith("spark://"):
+        return url
+    hostport = url[len("spark://"):]
+    if ":" in hostport:
+        host, port = hostport.split(":", 1)
+    else:
+        parts = hostport.split(".")
+        if len(parts) == 5:
+            host, port = ".".join(parts[:4]), parts[4]
+        else:
+            host, port = hostport, "7077"
+    return f"spark://{host.strip()}:{port.strip()}"
+
+
+SPARK_MASTER = clean_master_url(os.environ.get("SPARK_MASTER", "spark://172.20.10.3:7077"))
+
+
+def own_ip_towards(master_url):
+    host = master_url.split("://", 1)[-1].split(":")[0]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((host, 7077))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
 @st.cache_resource
 def get_spark():
     SparkSession, _ = import_pyspark()
@@ -47,7 +74,9 @@ def get_spark():
                .master(SPARK_MASTER)
                .config("spark.sql.shuffle.partitions", "8"))
     if SPARK_MASTER.startswith("spark://"):
-        builder = builder.config("spark.driver.host", DRIVER_HOST)
+        driver_host = os.environ.get("DRIVER_HOST") or own_ip_towards(SPARK_MASTER)
+        builder = (builder.config("spark.driver.host", driver_host)
+                   .config("spark.driver.bindAddress", "0.0.0.0"))
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     return spark
@@ -150,7 +179,7 @@ def compute_with_spark():
     taxa["_name_lc"] = taxa["name"].str.lower()
     taxa["_common_lc"] = taxa["commonName"].str.lower()
     stats = {"hosts": sorted(hosts), "seconds": round(time.time() - t0, 1), "rounds": rounds,
-             "master": SPARK_MASTER}
+             "master": SPARK_MASTER, "driver": spark.conf.get("spark.driver.host")}
     return taxa, report, analysis, stats
 
 
@@ -257,7 +286,7 @@ info, children = build_index(taxa)
 
 with st.sidebar:
     st.subheader("Spark cluster")
-    st.markdown(f"Master: `{stats['master']}`")
+    st.markdown(f"Master: `{stats['master']}`  \nApp (driver) IP: `{stats['driver']}`")
     st.markdown("Machines that processed data:")
     for h in stats["hosts"]:
         st.markdown(f"- `{h}`")
