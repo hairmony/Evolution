@@ -15,8 +15,8 @@ import streamlit as st
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-MY_IP = "10.110.15.223"
-MASTER = "local[2]" # local[2] 
+MASTER = "local[2]" # "spark://MASTER_IP" OR "local[2]""
+MY_IP = "10.157.240.163"
 FOLDER = "C:/bigdata"
 
 STATUS_NAMES = {
