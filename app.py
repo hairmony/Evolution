@@ -6,387 +6,350 @@ Evolution app for Big Data
     streamlit run app.py
 """
 
-import glob
-import os
-import socket
-import sys
-import time
-from collections import deque
-from pathlib import Path
+import findspark
+findspark.init()
 
+import altair as alt
 import pandas as pd
 import streamlit as st
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-DATA_DIR = Path(os.environ.get("BIGDATA_DIR", r"C:\bigdata")) / "data"
-RANKS_CSV = DATA_DIR.parent / "lookup" / "ranks.csv"
-MAX_CHILDREN_SHOWN = 8
-ENTITY = "http://www.wikidata.org/entity/"
-RANK_NAMES = {"Q7432": "species", "Q68947": "subspecies", "Q34740": "genus",
-              "Q35409": "family", "Q36602": "order", "Q37517": "class"}
+MY_IP = "10.110.15.223"
+MASTER = "local[2]" # local[2] 
+FOLDER = "C:/bigdata"
 
-st.set_page_config(page_title="Animal Lineage Explorer", page_icon="🌳", layout="wide")
-
-
-def import_pyspark():
-    try:
-        import pyspark
-    except ImportError:
-        home = os.environ["SPARK_HOME"]
-        sys.path.insert(0, os.path.join(home, "python"))
-        sys.path.insert(0, glob.glob(os.path.join(home, "python", "lib", "py4j-*.zip"))[0])
-    from pyspark.sql import SparkSession, functions as F
-    return SparkSession, F
-
-
-def clean_master_url(url):
-    url = url.strip().strip('"').rstrip("/")
-    if not url.startswith("spark://"):
-        return url
-    hostport = url[len("spark://"):]
-    if ":" in hostport:
-        host, port = hostport.split(":", 1)
-    else:
-        parts = hostport.split(".")
-        if len(parts) == 5:
-            host, port = ".".join(parts[:4]), parts[4]
-        else:
-            host, port = hostport, "7077"
-    return f"spark://{host.strip()}:{port.strip()}"
-
-
-SPARK_MASTER = clean_master_url(os.environ.get("SPARK_MASTER", "spark://172.20.10.3:7077"))
-
-
-def own_ip_towards(master_url):
-    host = master_url.split("://", 1)[-1].split(":")[0]
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect((host, 7077))
-        return s.getsockname()[0]
-    finally:
-        s.close()
+STATUS_NAMES = {
+    "Q211005": "Least Concern",
+    "Q719675": "Near Threatened",
+    "Q278113": "Vulnerable",
+    "Q96377276": "Endangered",
+    "Q219127": "Critically Endangered",
+    "Q239509": "Extinct in the Wild",
+    "Q237350": "Extinct",
+    "Q3245245": "Data Deficient",
+}
+ACTIVITY_NAMES = {
+    "Q101029366": "nocturnal",
+    "Q4284186": "diurnal",
+    "Q3255068": "crepuscular",
+    "Q5052479": "cathemeral",
+}
+RANK_NAMES = {
+    "Q7432": "species",
+    "Q68947": "subspecies",
+    "Q34740": "genus",
+    "Q35409": "family",
+    "Q36602": "order",
+    "Q37517": "class",
+    "Q164280": "subfamily",
+    "Q2136103": "superfamily",
+    "Q5867959": "suborder",
+    "Q2889003": "infraorder",
+    "Q227936": "tribe",
+    "Q713623": "clade",
+    "Q1306176": "hybrid",
+    "Q3238261": "subgenus",
+    "Q5867051": "subclass",
+    "Q5868144": "superorder",
+    "Q2007442": "infraclass",
+    "Q6054237": "magnorder",
+}
 
 
 @st.cache_resource
 def get_spark():
-    SparkSession, _ = import_pyspark()
-    builder = (SparkSession.builder.appName("AnimalLineageApp")
-               .master(SPARK_MASTER)
-               .config("spark.sql.shuffle.partitions", "8"))
-    if SPARK_MASTER.startswith("spark://"):
-        driver_host = os.environ.get("DRIVER_HOST") or own_ip_towards(SPARK_MASTER)
-        builder = (builder.config("spark.driver.host", driver_host)
-                   .config("spark.driver.bindAddress", "0.0.0.0"))
-    spark = builder.getOrCreate()
-    spark.sparkContext.setLogLevel("WARN")
-    return spark
+    builder = SparkSession.builder.appName("AnimalLineage").master(MASTER).config("spark.sql.shuffle.partitions", "8")
+    if MASTER.startswith("spark://"):
+        builder = builder.config("spark.driver.host", MY_IP).config("spark.driver.bindAddress", "0.0.0.0")
+    return builder.getOrCreate()
 
 
-def rank_names():
-    names = dict(RANK_NAMES)
-    if RANKS_CSV.exists():
-        r = pd.read_csv(RANKS_CSV, dtype=str)
-        names.update(dict(zip(r["rank"].str.replace(ENTITY, "", regex=False), r["rankLabel"])))
-    return names
+def short_id(column):
+    return F.regexp_replace(column, "http://www.wikidata.org/(entity|prop/direct)/", "")
 
 
-@st.cache_data(show_spinner=False)
-def compute_with_spark():
-    t0 = time.time()
-    spark = get_spark()
-    _, F = import_pyspark()
-
-    raw = (spark.read.csv(DATA_DIR.as_uri() + "/*.csv", header=True)
-           .withColumn("dataset", F.regexp_extract(F.input_file_name(), r"([^/\\]+)\.csv$", 1)))
-    for c in ["taxon", "parent", "rank"]:
-        raw = raw.withColumn(c, F.regexp_replace(c, ENTITY, ""))
-    raw = raw.repartition(8).cache()
-    hosts = raw.rdd.mapPartitions(lambda _: [socket.gethostname()]).distinct().collect()
-
-    n_raw = raw.count()
-    per = raw.groupBy("taxon").agg(
-        F.countDistinct("parent").alias("parents"),
-        F.countDistinct("commonName").alias("names"),
-        F.count("rank").alias("rank"),
-        F.count("parent").alias("parent_any"),
-        F.count("commonName").alias("common"),
-        F.max((F.col("taxon") == F.col("parent")).cast("int")).alias("self_parent"),
-    ).cache()
-    n_distinct = per.count()
-    report = pd.DataFrame([
-        ("Raw rows", n_raw),
-        ("Distinct taxa", n_distinct),
-        ("Duplicate rows removed", n_raw - n_distinct),
-        ("Taxa with 2+ parents (conflicting classification)", per.filter("parents > 1").count()),
-        ("Taxa with 2+ English common names", per.filter("names > 1").count()),
-        ("Taxa missing rank", per.filter("rank = 0").count()),
-        ("Taxa missing parent", per.filter("parent_any = 0").count()),
-        ("Taxa missing English common name", per.filter("common = 0").count()),
-        ("Taxa listed as their own parent", per.filter("self_parent = 1").count()),
-    ], columns=["check", "count"])
-
-    rmap = F.create_map([F.lit(x) for pair in rank_names().items() for x in pair])
-    clean = (raw.filter(F.col("parent").isNull() | (F.col("taxon") != F.col("parent")))
-             .groupBy("taxon").agg(
-                 F.first("name", ignorenulls=True).alias("name"),
-                 F.first("rank", ignorenulls=True).alias("rank_id"),
-                 F.min("parent").alias("parent"),
-                 F.min("commonName").alias("commonName"),
-                 F.first("dataset").alias("dataset"))
-             .withColumn("rank", F.coalesce(rmap[F.col("rank_id")], F.col("rank_id"), F.lit("unranked")))
-             .drop("rank_id").cache())
-
-    nodes = clean.select(F.col("taxon").alias("n_taxon"), F.col("parent").alias("n_parent"))
-    lin = clean.select("taxon", F.array("taxon").alias("path"), F.col("parent").alias("cur"))
-    rounds = 0
-    for _ in range(60):
-        rounds += 1
-        j = lin.join(nodes, lin.cur == nodes.n_taxon, "left")
-        ok = F.col("n_taxon").isNotNull() & ~F.array_contains("path", F.col("cur"))
-        lin = j.select(
-            "taxon",
-            F.when(ok, F.concat("path", F.array("cur"))).otherwise(F.col("path")).alias("path"),
-            F.when(ok, F.col("n_parent")).alias("cur"),
-        ).localCheckpoint()
-        if lin.filter(F.col("cur").isNotNull()).count() == 0:
-            break
-
-    lineage = lin.select("taxon", "path", (F.size("path") - 1).alias("depth")).join(clean, "taxon")
-    ranked = (lineage.select("taxon", F.explode("path").alias("ancestor"))
-              .join(clean.select(F.col("taxon").alias("ancestor"), F.col("rank").alias("a_rank"),
-                                 F.col("name").alias("a_name")), "ancestor"))
-    groups = ranked.groupBy("taxon").agg(
-        F.first(F.when(F.col("a_rank") == "order", F.col("a_name")), ignorenulls=True).alias("order"),
-        F.first(F.when(F.col("a_rank") == "family", F.col("a_name")), ignorenulls=True).alias("family"),
-    )
-    full = lineage.join(groups, "taxon", "left").cache()
-    species = full.filter(F.col("rank") == "species")
-    analysis = {
-        "per_order": species.groupBy("dataset", "order").count().toPandas(),
-        "per_family": species.groupBy("family").count().toPandas(),
-        "by_rank": full.groupBy("rank").count().toPandas(),
-        "coverage": species.groupBy("dataset").agg(
-            F.count("*").alias("species"),
-            F.round(100 * F.avg((F.col("commonName").isNotNull()).cast("int")), 1).alias("pct_with_common_name"),
-            F.round(F.avg("depth"), 1).alias("avg_lineage_depth"),
-            F.max("depth").alias("max_lineage_depth"),
-        ).toPandas(),
-    }
-    taxa = full.toPandas()
-
-    taxa["path"] = taxa["path"].map(list)
-    taxa["commonName"] = taxa["commonName"].fillna("")
-    taxa["_name_lc"] = taxa["name"].str.lower()
-    taxa["_common_lc"] = taxa["commonName"].str.lower()
-    stats = {"hosts": sorted(hosts), "seconds": round(time.time() - t0, 1), "rounds": rounds,
-             "master": SPARK_MASTER, "driver": spark.conf.get("spark.driver.host")}
-    return taxa, report, analysis, stats
+def make_map(names):
+    pairs = []
+    for code, name in names.items():
+        pairs += [F.lit(code), F.lit(name)]
+    return F.create_map(pairs)
 
 
 @st.cache_data
-def build_index(_df):
-    info = _df.set_index("taxon")[["name", "commonName", "rank", "parent", "depth"]].to_dict("index")
-    children = _df.dropna(subset=["parent"]).groupby("parent")["taxon"].apply(list).to_dict()
-    return info, children
+def load_data():
+    spark = get_spark()
+
+    animals = spark.read.csv(f"file:///{FOLDER}/data/*.csv", header=True)
+    animals = (animals.withColumn("taxon", short_id("taxon"))
+                      .withColumn("parent", short_id("parent"))
+                      .withColumn("rank", short_id("rank")))
+
+    features = spark.read.csv(f"file:///{FOLDER}/features/*.csv", header=True)
+    features = (features.withColumn("taxon", short_id("taxon"))
+                        .withColumn("prop", short_id("prop"))
+                        .withColumn("value", short_id("value")))
+
+    computers = animals.select(F.expr("reflect('java.net.InetAddress', 'getLocalHost')")).distinct()
+    computers = [row[0] for row in computers.collect()]
+
+    clean = animals.groupBy("taxon").agg(
+        F.first("name").alias("name"),
+        F.initcap(F.min_by("commonName", F.length("commonName"))).alias("common"),
+        F.first("rank").alias("rank"),
+        F.min("parent").alias("parent"),
+    )
+    clean = clean.withColumn("rank", F.coalesce(make_map(RANK_NAMES)[F.col("rank")], F.lit("other")))
+    clean = clean.cache()
+
+    parents = clean.select(F.col("taxon").alias("p_taxon"), F.col("parent").alias("p_parent"))
+    lineage = clean.select("taxon", F.array("taxon").alias("path"), F.col("parent").alias("next"))
+    for step in range(40):
+        joined = lineage.join(parents, lineage.next == parents.p_taxon, "left")
+        can_climb = F.col("p_taxon").isNotNull() & ~F.array_contains("path", F.col("next"))
+        lineage = joined.select(
+            "taxon",
+            F.when(can_climb, F.concat("path", F.array("next"))).otherwise(F.col("path")).alias("path"),
+            F.when(can_climb, F.col("p_parent")).alias("next"),
+        ).localCheckpoint()
+        if lineage.filter(F.col("next").isNotNull()).count() == 0:
+            break
+
+    orders = clean.filter(F.col("rank") == "order").select(F.col("taxon").alias("order_id"),
+                                                           F.col("name").alias("order"))
+    animal_order = (lineage.select("taxon", F.explode("path").alias("order_id"))
+                           .join(orders, "order_id")
+                           .select("taxon", "order")
+                           .dropDuplicates(["taxon"]))
+    taxa = clean.join(lineage.select("taxon", "path"), "taxon").join(animal_order, "taxon", "left")
+
+    counts = features.groupBy("taxon").agg(
+        F.countDistinct("prop").alias("features"),
+        F.count(F.when(F.col("prop") == "P1843", True)).alias("languages"),
+    )
+    images = (features.filter(F.col("prop") == "P18")
+                      .groupBy("taxon").agg(F.min("value").alias("image")))
+    card_props = ["P141", "P9566", "P4214", "P3063"]
+    card = (features.filter(F.col("prop").isin(card_props))
+                    .groupBy("taxon").pivot("prop", card_props).agg(F.min("value"))
+                    .withColumnRenamed("P141", "status")
+                    .withColumnRenamed("P9566", "activity")
+                    .withColumnRenamed("P4214", "lifespan")
+                    .withColumnRenamed("P3063", "gestation")
+                    .join(counts, "taxon", "right"))
+
+    return {
+        "taxa": taxa.toPandas(),
+        "computers": computers,
+        "images": dict(images.toPandas().values),
+        "cards": card.toPandas().set_index("taxon"),
+    }
 
 
-def search(df, text, limit=50):
-    t = text.strip().lower()
-    if not t:
-        return df.iloc[0:0]
-    hit = df[df["_common_lc"].str.contains(t, regex=False) | df["_name_lc"].str.contains(t, regex=False)].copy()
-    hit["_score"] = 3
-    hit.loc[hit["_common_lc"].str.startswith(t) | hit["_name_lc"].str.startswith(t), "_score"] = 1
-    hit.loc[(hit["_common_lc"] == t) | (hit["_name_lc"] == t), "_score"] = 0
-    hit["_has_common"] = hit["commonName"] == ""
-    return hit.sort_values(["_score", "_has_common", "depth", "name"]).head(limit)
+def label(row):
+    if isinstance(row["common"], str) and row["common"]:
+        return f"{row['common']} ({row['name']})"
+    return row["name"]
 
 
-def esc(s):
-    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+def open_lineage(taxon, name):
+    st.session_state["clicked_id"] = taxon
+    st.session_state["search"] = name.lower()
 
 
-def node_label(info, tid):
-    r = info.get(tid)
-    if r is None:
-        return tid
-    lines = [r["name"]]
-    if r["commonName"]:
-        lines.append(f"({r['commonName']})")
-    lines.append(r["rank"])
-    return "\\n".join(esc(x) for x in lines)
+def show_card(taxon, animal_id):
+    row = taxa.set_index("taxon").loc[taxon]
+    info = data["cards"].loc[taxon] if taxon in data["cards"].index else None
+
+    with st.container(border=True):
+        picture = thumbnail(data["images"].get(taxon))
+        if picture:
+            st.image(picture.replace("?width=240", "?width=500"), width="stretch")
+        st.subheader(short_label(row))
+        st.caption(f"{row['name']} · {row['rank']}")
+
+        by_id = taxa.set_index("taxon")
+        for rank in ["class", "order", "family", "genus", "species"]:
+            match = [t for t in row["path"] if by_id.loc[t, "rank"] == rank]
+            st.write(f"**{rank.title()}:** {label(by_id.loc[match[0]]) if match else 'N/A'}")
+        st.divider()
+
+        facts = {
+            "Conservation status": STATUS_NAMES.get(info["status"], info["status"]) if info is not None else None,
+            "Active": ACTIVITY_NAMES.get(info["activity"], info["activity"]) if info is not None else None,
+            "Longest recorded lifespan": info["lifespan"] if info is not None else None,
+            "Gestation period": info["gestation"] if info is not None else None,
+        }
+        for key, value in facts.items():
+            st.write(f"**{key}:** {value if pd.notna(value) and value != '' else 'N/A'}")
+        if info is not None and (pd.notna(info["lifespan"]) or pd.notna(info["gestation"])):
+            st.caption("Lifespan and gestation come without units in the download.")
+
+        st.link_button("Open on Wikidata", f"https://www.wikidata.org/wiki/{taxon}")
+        if taxon != animal_id:
+            st.button("Open this lineage", type="primary", on_click=open_lineage, args=(taxon, row["name"]))
 
 
-def lineage_graph(selected, path, levels_up, info, children):
-    chain = set(path)
-    anc_idx = min(levels_up, len(path) - 1)
-    branch_root = path[anc_idx]
-
-    nodes, edges, more = [], [], []
-    seen = set()
+def short_label(row):
+    if isinstance(row["common"], str) and row["common"]:
+        return row["common"]
+    return row["name"]
 
 
-    q = deque([(branch_root, 0)])
-    while q:
-        tid, d = q.popleft()
-        if tid in seen:
-            continue
-        seen.add(tid)
-        nodes.append(tid)
-        if d >= anc_idx:
-            continue
-        kids = children.get(tid, [])
-        kids = sorted(kids, key=lambda k: (k not in chain,
-                                           info.get(k, {}).get("commonName", "") == "",
-                                           info.get(k, {}).get("name", "")))
-        for k in kids[:MAX_CHILDREN_SHOWN]:
-            edges.append((tid, k))
-            q.append((k, d + 1))
-        if len(kids) > MAX_CHILDREN_SHOWN:
-            more.append((tid, len(kids) - MAX_CHILDREN_SHOWN))
+def thumbnail(url):
+    if isinstance(url, str) and url.startswith("http"):
+        return url.replace("http://", "https://") + "?width=240"
+    return ""
 
 
-    for i in range(anc_idx, len(path) - 1):
-        child, parent = path[i], path[i + 1]
-        nodes.append(parent)
-        edges.append((parent, child))
-
-    lines = [
-        "digraph G {",
-        '  rankdir=TB; bgcolor="transparent"; nodesep=0.25; ranksep=0.35;',
-        '  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,'
-        ' color="#9aa5b1", fillcolor="#f5f7fa", fontcolor="#1f2933"];',
-        '  edge [color="#9aa5b1", arrowhead=none];',
-    ]
-    for tid in dict.fromkeys(nodes):
-        style = ""
-        if tid == selected:
-            style = ', fillcolor="#2f855a", fontcolor="white", color="#22543d", penwidth=2'
-        elif tid in chain:
-            style = ', fillcolor="#e6f4ea", color="#2f855a", penwidth=1.5'
-        lines.append(f'  "{tid}" [label="{node_label(info, tid)}"{style}];')
-    for a, b in dict.fromkeys(edges):
-        bold = ', color="#2f855a", penwidth=2' if a in chain and b in chain else ""
-        lines.append(f'  "{a}" -> "{b}" [{bold.lstrip(", ")}];')
-    for tid, n in more:
-        mid = f"more_{tid}"
-        lines.append(f'  "{mid}" [label="+{n} more", shape=plaintext, style="", fontcolor="#7b8794"];')
-        lines.append(f'  "{tid}" -> "{mid}" [style=dashed];')
-    lines.append("}")
-    return "\n".join(lines), len(dict.fromkeys(nodes))
+def pick_relatives(group, images, how_many):
+    group = group.copy()
+    group["no_name"] = group["common"].isna()
+    group["no_image"] = ~group["taxon"].isin(list(images))
+    return group.sort_values(["no_name", "no_image"])["taxon"].head(how_many).tolist()
 
 
-if not list(DATA_DIR.glob("*.csv")):
-    st.error(f"No CSV files in {DATA_DIR}. Download them from query.wikidata.org first.")
-    st.stop()
+def tree_chart(animal_id, taxa, images, whole_tree):
+    by_id = taxa.set_index("taxon")
+    path = list(by_id.loc[animal_id, "path"])
+    per_row = 6
+    if whole_tree:
+        ancestors = path[1:][::-1]
+        child_limit, grandchild_limit = None, 120
+    else:
+        ancestors = path[1:3][::-1]
+        child_limit, grandchild_limit = per_row, per_row
 
-with st.spinner(f"Spark is processing the data on {SPARK_MASTER} ..."):
-    taxa, report, analysis, stats = compute_with_spark()
-info, children = build_index(taxa)
+    siblings = pick_relatives(taxa[(taxa["parent"] == by_id.loc[animal_id, "parent"]) & (taxa["taxon"] != animal_id)],
+                              images, 4)
+    child_rows = taxa[taxa["parent"] == animal_id]
+    children = pick_relatives(child_rows, images, child_limit or len(child_rows))
+    grandchild_rows = taxa[taxa["parent"].isin(children)].copy()
+    grandchild_rows["no_name"] = grandchild_rows["common"].isna()
+    grandchild_rows["no_image"] = ~grandchild_rows["taxon"].isin(list(images))
+    grandchild_rows = grandchild_rows.sort_values(["no_name", "no_image"])
+    grandchild_rows["turn"] = grandchild_rows.groupby("parent").cumcount()
+    grandchild_rows["parent_order"] = grandchild_rows["parent"].map(children.index)
+    taken = grandchild_rows.sort_values(["turn", "parent_order"]).head(grandchild_limit)
+    grandchildren = taken.sort_values(["parent_order", "turn"])["taxon"].tolist()
+    hidden = (len(child_rows) - len(children)) + (len(grandchild_rows) - len(grandchildren))
 
-with st.sidebar:
-    st.subheader("Spark cluster")
-    st.markdown(f"Master: `{stats['master']}`  \nApp (driver) IP: `{stats['driver']}`")
-    st.markdown("Machines that processed data:")
-    for h in stats["hosts"]:
-        st.markdown(f"- `{h}`")
-    st.markdown(f"Lineage rounds: `{stats['rounds']}`  \nProcessing time: `{stats['seconds']} s`")
-    if st.button("Recompute on cluster"):
-        compute_with_spark.clear()
-        st.rerun()
+    rows = []
+    for y, taxon in enumerate(ancestors):
+        rows.append({"taxon": taxon, "x": 0, "y": y, "kind": "ancestor"})
+    middle = len(ancestors)
+    rows.append({"taxon": animal_id, "x": 0, "y": middle, "kind": "selected"})
+    for i, taxon in enumerate(siblings):
+        side = -1 if i % 2 == 0 else 1
+        rows.append({"taxon": taxon, "x": side * (i // 2 + 1), "y": middle, "kind": "sibling"})
 
-st.title("🌳 Animal Lineage Explorer")
-st.caption(f"{len(taxa):,} taxa from Wikidata, processed on a PySpark cluster")
+    def add_level(level, first_row, kind):
+        for i, taxon in enumerate(level):
+            row, column = i // per_row, i % per_row
+            in_this_row = min(per_row, len(level) - row * per_row)
+            rows.append({"taxon": taxon, "x": column - (in_this_row - 1) / 2, "y": first_row + row, "kind": kind})
+        return first_row + (len(level) + per_row - 1) // per_row
 
-tab_tree, tab_value, tab_quality = st.tabs(["Lineage explorer", "Analysis", "Data quality"])
+    after_children = add_level(children, middle + 1, "child")
+    add_level(grandchildren, after_children, "grandchild")
+    nodes = pd.DataFrame(rows)
+    nodes["name"] = [short_label(by_id.loc[t]) for t in nodes["taxon"]]
+    nodes["rank"] = [by_id.loc[t, "rank"] for t in nodes["taxon"]]
+    nodes["image"] = [thumbnail(images.get(t)) for t in nodes["taxon"]]
+    position = nodes.set_index("taxon")
 
+    below_label = 0.45
+    top_of_square = 0.28
+    branch_gap = 0.36
+    lines = []
+    for row in range(len(ancestors) - 1):
+        lines.append({"x": 0, "y": row + below_label, "x2": 0, "y2": row + 1 - top_of_square})
+    if ancestors:
+        for _, node in nodes[nodes["y"] == middle].iterrows():
+            lines.append({"x": 0, "y": middle - 1 + below_label, "x2": node["x"], "y2": middle - top_of_square})
+    kids = nodes[nodes["kind"] == "child"]
+    if len(kids):
+        lines.append({"x": 0, "y": middle + below_label, "x2": 0, "y2": kids["y"].max() - branch_gap})
+    for row_y, row_kids in kids.groupby("y"):
+        left, right = min(row_kids["x"].min(), 0), max(row_kids["x"].max(), 0)
+        lines.append({"x": left, "y": row_y - branch_gap, "x2": right, "y2": row_y - branch_gap})
+        for x_position in row_kids["x"]:
+            lines.append({"x": x_position, "y": row_y - branch_gap, "x2": x_position, "y2": row_y - top_of_square})
+    for _, node in nodes[nodes["kind"] == "grandchild"].iterrows():
+        parent = position.loc[by_id.loc[node["taxon"], "parent"]]
+        lines.append({"x": parent["x"], "y": parent["y"] + below_label, "x2": node["x"], "y2": node["y"] - top_of_square})
+    lines = pd.DataFrame(lines, columns=["x", "y", "x2", "y2"])
+    last_row = nodes["y"].max()
 
-with tab_tree:
-    left, right = st.columns([1, 3], gap="large")
+    half = max(per_row, 2 * (len(siblings) // 2 + len(siblings) % 2) + 1) / 2 + 0.2
+    node = "min(width / 8.4 * 0.85, 120)"
+    x = alt.X("x:Q", scale=alt.Scale(domain=[-half, half]), axis=None)
+    y = alt.Y("y:Q", scale=alt.Scale(domain=[last_row + 0.7, -0.6]), axis=None)
+    colors = alt.Scale(domain=["selected", "ancestor", "sibling", "child", "grandchild"],
+                       range=["#16a34a", "#166534", "#334155", "#1e3a5f", "#312e5a"])
+    click_box = alt.selection_point(name="click_box", fields=["taxon"], on="click")
+    click_picture = alt.selection_point(name="click_picture", fields=["taxon"], on="click")
 
-    with left:
-        query = st.text_input("Search an animal", value="lion", placeholder="lion, Panthera leo, python…")
-        matches = search(taxa, query)
-        if matches.empty:
-            st.info("No match. Try the Latin name, or a different spelling.")
-            st.stop()
-
-        def describe(tid):
-            r = info[tid]
-            return f"{r['commonName'] or r['name']}  ·  {r['name']} ({r['rank']})" if r["commonName"] \
-                else f"{r['name']} ({r['rank']})"
-
-        selected = st.selectbox(f"{len(matches)} match(es)", matches["taxon"].tolist(), format_func=describe)
-        row = taxa.loc[taxa["taxon"] == selected].iloc[0]
-        path = row["path"]
-
-        levels = st.slider("How far out to show relatives", 1, min(4, max(1, len(path) - 1)), 2,
-                           help="1 = siblings (same parent), 2 = cousins (same grandparent), and so on")
-        show_all = st.toggle("Show the whole lineage up to the top", value=False)
-
-        st.markdown(f"**{row['name']}**" + (f" — {row['commonName']}" if row["commonName"] else ""))
-        st.markdown(f"Rank: `{row['rank']}`  \nOrder: `{row.get('order') or '–'}`  \n"
-                    f"Family: `{row.get('family') or '–'}`  \nLineage depth: `{row['depth']}` steps")
-        st.markdown(f"[Open on Wikidata ↗](https://www.wikidata.org/wiki/{selected})")
-
-    with right:
-        shown_path = path if show_all else path[: max(levels + 6, 1)]
-        dot, n_nodes = lineage_graph(selected, shown_path, levels, info, children)
-        st.graphviz_chart(dot, width="stretch")
-        if not show_all and len(path) > len(shown_path):
-            st.caption(f"Showing the nearest {len(shown_path) - 1} of {len(path) - 1} ancestors. "
-                       "Turn on 'Show the whole lineage' to see all of them.")
-
-        with st.expander("Lineage as a list"):
-            st.dataframe(
-                pd.DataFrame([{"step": i, "rank": info[t]["rank"], "name": info[t]["name"],
-                               "common name": info[t]["commonName"], "wikidata": t}
-                              for i, t in enumerate(path) if t in info]),
-                hide_index=True, width="stretch",
-            )
-
-
-with tab_value:
-    per_order = analysis["per_order"]
-    per_family = analysis["per_family"]
-    by_rank = analysis["by_rank"]
-    coverage = analysis["coverage"]
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if len(per_order):
-            st.subheader("Species per order (top 15)")
-            top = per_order.dropna(subset=["order"]).nlargest(15, "count")
-            st.bar_chart(top, x="order", y="count", color="dataset", horizontal=True)
-    with c2:
-        if len(per_family):
-            st.subheader("Biggest families (top 15)")
-            st.bar_chart(per_family.dropna(subset=["family"]).nlargest(15, "count"),
-                         x="family", y="count", horizontal=True)
-
-    c3, c4 = st.columns(2)
-    with c3:
-        if len(by_rank):
-            st.subheader("Taxa by rank")
-            st.bar_chart(by_rank.dropna(subset=["rank"]).nlargest(12, "count"), x="rank", y="count")
-    with c4:
-        if len(coverage):
-            st.subheader("Per dataset")
-            st.dataframe(coverage.rename(columns={
-                "pct_with_common_name": "% with English name",
-                "avg_lineage_depth": "avg lineage depth",
-                "max_lineage_depth": "max lineage depth"}), hide_index=True, width="stretch")
+    edges = alt.Chart(lines).mark_rule(color="#94a3b8").encode(x=x, y=y, x2="x2:Q", y2="y2:Q")
+    frames = alt.Chart(nodes).mark_square(size=alt.expr(f"pow({node} + 10, 2)"), opacity=1, cursor="pointer").encode(
+        x=x, y=y, color=alt.Color("kind:N", scale=colors, legend=None)).add_params(click_box)
+    pictures = alt.Chart(nodes[nodes["image"] != ""]).mark_image(
+        width=alt.expr(node), height=alt.expr(node), cursor="pointer").encode(
+        x=x, y=y, url="image:N").add_params(click_picture)
+    names = alt.Chart(nodes).mark_text(dy=alt.expr(f"{node} / 2 + 18"), fontSize=13, color="#ffffff").encode(
+        x=x, y=y, text="name:N")
+    ranks = alt.Chart(nodes).mark_text(dy=alt.expr(f"{node} / 2 + 34"), fontSize=11, color="#cbd5e1").encode(
+        x=x, y=y, text="rank:N")
+    chart = alt.layer(edges, frames, pictures, names, ranks).properties(height=250 * (last_row + 1))
+    return chart, hidden
 
 
-with tab_quality:
-    st.subheader("Problems found in the raw data (Veracity)")
-    n_raw = int(report.loc[report["check"] == "Raw rows", "count"].iloc[0])
-    n_distinct = int(report.loc[report["check"] == "Distinct taxa", "count"].iloc[0])
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Raw rows downloaded", f"{n_raw:,}")
-    m2.metric("Distinct taxa", f"{n_distinct:,}")
-    m3.metric("Duplicate rows", f"{n_raw - n_distinct:,}",
-              f"{100 * (n_raw - n_distinct) / n_raw:.1f}% of raw", delta_color="off")
-    issues = report[~report["check"].isin(["Raw rows", "Distinct taxa", "Duplicate rows removed"])]
-    st.bar_chart(issues, x="check", y="count", horizontal=True)
-    st.dataframe(report, hide_index=True, width="stretch")
+st.set_page_config(page_title="Tree of Life", layout="wide")
+st.title("Tree of Life")
+
+with st.spinner("Spark is processing the data..."):
+    data = load_data()
+taxa = data["taxa"]
+
+st.sidebar.header("PySpark Cluster")
+st.sidebar.write(f"Master: {MASTER}")
+st.sidebar.write("Workers:")
+for computer in data["computers"]:
+    st.sidebar.write(f"- {computer}")
+
+search = st.text_input("Search", "snow leopard", key="search").lower()
+found = taxa[taxa["common"].str.lower().str.contains(search, na=False)
+             | taxa["name"].str.lower().str.contains(search, na=False)].copy()
+found["exact"] = (found["common"].str.lower() == search) | (found["name"].str.lower() == search)
+found["is_species"] = found["rank"] == "species"
+found = found.sort_values(["exact", "is_species"], ascending=False).head(30)
+
+if found.empty:
+    st.write("No animal found.")
+else:
+    choices = dict(zip(found.apply(label, axis=1), found["taxon"]))
+    ids = list(choices.values())
+    start = ids.index(st.session_state["clicked_id"]) if st.session_state.get("clicked_id") in ids else 0
+    picked = st.selectbox("Select a taxon", list(choices), index=start, key=f"pick_{search}")
+    animal_id = choices[picked]
+
+    st.caption("Click on a taxon in the tree to see info.")
+    whole_tree_text = "Show expanded tree"
+    whole_tree = st.toggle(whole_tree_text)
+    chart, hidden = tree_chart(animal_id, taxa, data["images"], whole_tree)
+    tree_column, card_column = st.columns([3, 1])
+    with tree_column:
+        event = st.altair_chart(chart, width="stretch", on_select="rerun", key=f"tree_{animal_id}")
+        if hidden > 0:
+            st.caption(f"{hidden} more groups below are not shown. "
+                       + (f"Turn on '{whole_tree_text}' to see more." if not whole_tree
+                          else "Click on a node above to explore it."))
+    clicked = (event.selection.get("click_box") or []) + (event.selection.get("click_picture") or [])
+    with card_column:
+        show_card(clicked[0]["taxon"] if clicked else animal_id, animal_id)
+
+    by_id = taxa.set_index("taxon")
+    steps = [by_id.loc[t] for t in by_id.loc[animal_id, "path"]]
+    st.write("Full lineage:")
+    st.dataframe(pd.DataFrame({"rank": [s["rank"] for s in steps],
+                               "name": [label(s) for s in steps]}), hide_index=True)
