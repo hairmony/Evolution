@@ -17,7 +17,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 MASTER = "local[2]" # "spark://MASTER_IP" OR "local[2]""
-MY_IP = "10.157.240.163"
+MY_IP = "10.157.240.163" # <--- CHANGE THIS!
 FOLDER = "C:/bigdata"
 
 STATUS_NAMES = {
@@ -30,12 +30,14 @@ STATUS_NAMES = {
     "Q237350": "Extinct",
     "Q3245245": "Data Deficient",
 }
+
 ACTIVITY_NAMES = {
     "Q101029366": "nocturnal",
     "Q4284186": "diurnal",
     "Q3255068": "crepuscular",
     "Q5052479": "cathemeral",
 }
+
 RANK_NAMES = {
     "Q7432": "species",
     "Q68947": "subspecies",
@@ -60,7 +62,7 @@ RANK_NAMES = {
 
 @st.cache_resource
 def get_spark():
-    builder = SparkSession.builder.appName("AnimalLineage").master(MASTER).config("spark.sql.shuffle.partitions", "8")
+    builder = SparkSession.builder.appName("TreeOfLife").master(MASTER).config("spark.sql.shuffle.partitions", "8")
     if MASTER.startswith("spark://"):
         builder = builder.config("spark.driver.host", MY_IP).config("spark.driver.bindAddress", "0.0.0.0")
     return builder.getOrCreate()
@@ -76,6 +78,7 @@ def make_map(names):
         pairs += [F.lit(code), F.lit(name)]
     return F.create_map(pairs)
 
+# Data loading/cleaning
 
 @st.cache_data
 def load_data():
@@ -133,12 +136,18 @@ def load_data():
                  .join(animal_order, "taxon", "left")
                  .join(animal_class, "taxon", "left"))
 
-    downloaded = (animals.select("taxon", F.input_file_name().alias("file")).distinct()
-                         .filter(~F.col("file").endswith("spine.csv"))
-                         .join(taxa.filter(F.col("rank") == "class").select("taxon", "name", F.size("path").alias("depth")),
-                               "taxon")
-                         .groupBy("file").agg(F.min_by("name", "depth").alias("class"),
-                                              F.min_by("taxon", "depth").alias("class_id")))
+    file_taxa = (animals.select("taxon", F.input_file_name().alias("file")).distinct()
+                        .filter(~F.col("file").endswith("spine.csv"))
+                        .join(lineage.select("taxon", "path"), "taxon"))
+    in_file = (file_taxa.select("file", "taxon", F.explode("path").alias("ancestor"))
+                        .join(file_taxa.select("file", F.col("taxon").alias("ancestor")), ["file", "ancestor"]))
+    below = in_file.groupBy("file", "ancestor").count().withColumnRenamed("ancestor", "taxon")
+    above = in_file.groupBy("file", "taxon").agg((F.count("*") - 1).alias("above"))
+    total = file_taxa.groupBy("file").agg(F.count("*").alias("total"))
+    roots = (file_taxa.join(below, ["file", "taxon"]).join(above, ["file", "taxon"]).join(total, "file")
+                      .filter((F.col("count") + F.col("above")) >= 0.99 * F.col("total")))
+    downloaded = (roots.groupBy("file").agg(F.max_by("taxon", F.size("path")).alias("root_id"))
+                       .join(clean.select(F.col("taxon").alias("root_id"), F.col("name").alias("class")), "root_id"))
 
     counts = features.groupBy("taxon").agg(
         F.countDistinct("prop").alias("features"),
@@ -172,16 +181,16 @@ def load_data():
                        .withColumn("kind", value_kind)
                        .groupBy("class", "kind").count())
 
-    facts = {"P2067": "Body mass", "P18": "Photo", "P141": "Conservation status", "P9566": "Activity pattern",
-             "P3063": "Gestation", "P4214": "Lifespan"}
-    values_per_fact = (features.filter(F.col("prop").isin(list(facts)))
-                               .groupBy("prop", "taxon").agg(F.countDistinct("value").alias("values"))
-                               .join(taxa.select("taxon", "class"), "taxon")
-                               .filter(F.col("class").isNotNull()))
-    conflicts = (values_per_fact.groupBy("class", "prop").agg(
+    feature_names = {"P2067": "Body mass", "P18": "Photo", "P141": "Conservation status",
+                     "P9566": "Activity pattern", "P3063": "Gestation", "P4214": "Lifespan"}
+    values_per_feature = (features.filter(F.col("prop").isin(list(feature_names)))
+                                  .groupBy("prop", "taxon").agg(F.countDistinct("value").alias("values"))
+                                  .join(taxa.select("taxon", "class"), "taxon")
+                                  .filter(F.col("class").isNotNull()))
+    conflicts = (values_per_feature.groupBy("class", "prop").agg(
                      F.count("*").alias("animals"),
                      F.sum((F.col("values") > 1).cast("int")).alias("several_values"))
-                 .withColumn("fact", make_map(facts)[F.col("prop")]))
+                 .withColumn("feature", make_map(feature_names)[F.col("prop")]))
 
     return {
         "volume": volume.toPandas(),
@@ -227,11 +236,11 @@ def label(row):
         return f"{row['common']} ({row['name']})"
     return row["name"]
 
-
 def open_lineage(taxon, name):
-    st.session_state["clicked_id"] = taxon
     st.session_state["search"] = name.lower()
+    st.session_state[f"pick_{name.lower()}"] = taxon
 
+# Card display
 
 def show_card(taxon, animal_id):
     row = taxa.set_index("taxon").loc[taxon]
@@ -250,33 +259,36 @@ def show_card(taxon, animal_id):
             st.write(f"**{rank.title()}:** {label(by_id.loc[match[0]]) if match else 'N/A'}")
         st.divider()
 
-        facts = {
+        features = {
             "Conservation status": STATUS_NAMES.get(info["status"], info["status"]) if info is not None else None,
             "Active": ACTIVITY_NAMES.get(info["activity"], info["activity"]) if info is not None else None,
             "Longest recorded lifespan": info["lifespan"] if info is not None else None,
             "Gestation period": info["gestation"] if info is not None else None,
         }
-        for key, value in facts.items():
+        for key, value in features.items():
             st.write(f"**{key}:** {value if pd.notna(value) and value != '' else 'N/A'}")
         if info is not None and (pd.notna(info["lifespan"]) or pd.notna(info["gestation"])):
             st.caption("Lifespan and gestation come without units in the download.")
 
         st.link_button("Open on Wikidata", f"https://www.wikidata.org/wiki/{taxon}")
         if taxon != animal_id:
-            st.button("Open this lineage", type="primary", on_click=open_lineage, args=(taxon, row["name"]))
+            st.button("Open this lineage", type="primary", on_click=open_lineage, args=(taxon, short_label(row)))
 
+# Node label
 
 def short_label(row):
     if isinstance(row["common"], str) and row["common"]:
         return row["common"]
     return row["name"]
 
+# Node image
 
 def thumbnail(url):
     if isinstance(url, str) and url.startswith("http"):
         return url.replace("http://", "https://") + "?width=240"
     return ""
 
+# Tree generation
 
 def tree_chart(animal_id, taxa, images, whole_tree):
     by_id = taxa.set_index("taxon")
@@ -361,20 +373,26 @@ def tree_chart(animal_id, taxa, images, whole_tree):
     pictures = alt.Chart(nodes[nodes["image"] != ""]).mark_image(
         width=alt.expr(node), height=alt.expr(node), cursor="pointer").encode(
         x=x, y=y, url="image:N").add_params(click_picture)
-    names = alt.Chart(nodes).mark_text(dy=alt.expr(f"{node} / 2 + 18"), fontSize=13, fontWeight="bold").encode(
+    tags = alt.Chart(nodes).mark_rect(width=alt.expr(f"{node} + 10"), height=40,
+                                      yOffset=alt.expr(f"{node} / 2 + 25")).encode(
+        x=x, y=y, color=alt.Color("kind:N", scale=colors, legend=None))
+    names = alt.Chart(nodes).mark_text(dy=alt.expr(f"{node} / 2 + 18"), fontSize=13, fontWeight="bold",
+                                       color="white", limit=alt.expr(node)).encode(
         x=x, y=y, text="name:N")
-    ranks = alt.Chart(nodes).mark_text(dy=alt.expr(f"{node} / 2 + 34"), fontSize=11).encode(
+    ranks = alt.Chart(nodes).mark_text(dy=alt.expr(f"{node} / 2 + 34"), fontSize=11, color="white").encode(
         x=x, y=y, text="rank:N")
-    chart = alt.layer(edges, frames, pictures, names, ranks).properties(height=250 * (last_row + 1))
+    chart = alt.layer(edges, frames, tags, pictures, names, ranks).properties(height=250 * (last_row + 1))
     return chart, hidden
 
 
 st.set_page_config(page_title="Tree of Life", layout="wide")
-st.title("Tree of Life")
+st.title("TREE OF LIFE")
 
 with st.spinner("Spark is processing the data..."):
     data = load_data()
 taxa = data["taxa"]
+
+# PySpark sidebar shows workers and master connected
 
 st.sidebar.header("PySpark Cluster")
 st.sidebar.write(f"Master: {MASTER}")
@@ -382,23 +400,27 @@ st.sidebar.write("Workers:")
 for computer in data["computers"]:
     st.sidebar.write(f"- {computer}")
 
-tab1, tab2 = st.tabs(["Lineage", "Data"])
+
+tab1, tab2 = st.tabs(["Tree of Life", "Data Visualization"])
+
+####################
+# INTERACTIVE TREE #
+####################
 
 with tab1:
-    search = st.text_input("Search", "snow leopard", key="search").lower()
+    labels = dict(zip(taxa["taxon"], taxa["common"].fillna(taxa["name"])))
+    search_column, pick_column = st.columns(2)
+    search = search_column.text_input("Search", "snow leopard", key="search").lower()
     found = taxa[taxa["common"].str.lower().str.contains(search, na=False)
                  | taxa["name"].str.lower().str.contains(search, na=False)]
     exact = (found["common"].str.lower() == search) | (found["name"].str.lower() == search)
     found = pd.concat([found[exact], found[~exact]]).head(30)
 
     if found.empty:
-        st.write("No animal found.")
+        pick_column.write("No animal found.")
     else:
-        choices = dict(zip(found.apply(label, axis=1), found["taxon"]))
-        ids = list(choices.values())
-        start = ids.index(st.session_state["clicked_id"]) if st.session_state.get("clicked_id") in ids else 0
-        picked = st.selectbox("Select a taxon", list(choices), index=start, key=f"pick_{search}")
-        animal_id = choices[picked]
+        animal_id = pick_column.selectbox("Select a taxon", found["taxon"].tolist(), format_func=labels.get,
+                                          key=f"pick_{search}")
 
         st.caption("Click on a taxon in the tree to see info.")
         whole_tree_text = "Show expanded tree"
@@ -420,6 +442,10 @@ with tab1:
         st.write("Full lineage:")
         st.dataframe(pd.DataFrame({"rank": [s["rank"] for s in steps],
                                    "name": [label(s) for s in steps]}), hide_index=True)
+        
+######################
+# DATA VISUALIZATION #
+######################
 
 with tab2:
     st.subheader("VOLUME: Species per Order")
@@ -437,11 +463,11 @@ with tab2:
     total = volume["count"].sum()
     top = volume.iloc[0]
     
-    st.write(f"{total:,} species across {len(volume)} orders, out of {len(taxa):,} groups in the whole tree. "
-             f"{top['order']} alone has {top['count']:,} species ({top['count'] / total:.0%}). "
-             "These counts include extinct and fossil species.")
+    st.write(f"{top['order']} contains {top['count']:,} species out of {total:,} (~{top['count'] / total:.0%}) across {len(volume)} orders in the dataset.")
 
     st.subheader("VARIETY: Types of values in the database")
+
+    st.write("A chart of the different types of data used in the dataset.")
     
     variety = data["variety"]
     
@@ -459,10 +485,10 @@ with tab2:
         tooltip=[alt.Tooltip("kind:N", title="Format"), alt.Tooltip("count:Q", title="Count"),
                  alt.Tooltip("share:Q", title="Share", format=".0%")]), width="stretch")
     
-    st.write("Share of each kind of value: links to other items (like conservation status), "
-             "numbers, images, audio, video and 3D models.")
 
     st.subheader("VERACITY: Features with conflicting values")
+
+    st.write("Some are unique terms for newborn vs adult, male vs female.")
     
     conflicts = data["conflicts"]
     
@@ -471,18 +497,16 @@ with tab2:
     
     if conflict_classes:
         conflicts = conflicts[conflicts["class"].isin(conflict_classes)]
-    conflicts = conflicts.groupby("fact", as_index=False)[["animals", "several_values"]].sum()
+    conflicts = conflicts.groupby("feature", as_index=False)[["animals", "several_values"]].sum()
     conflicts["share"] = conflicts["several_values"] / conflicts["animals"]
     
     st.altair_chart(alt.Chart(conflicts).mark_bar().encode(
         x=alt.X("share:Q", title="Species %", axis=alt.Axis(format="%")),
-        y=alt.Y("fact:N", sort="-x", title="Feature"),
-        tooltip=[alt.Tooltip("fact:N", title="Feature"), alt.Tooltip("animals:Q", title="Species with Feature"),
+        y=alt.Y("feature:N", sort="-x", title="Feature"),
+        tooltip=[alt.Tooltip("feature:N", title="Feature"), alt.Tooltip("animals:Q", title="Species with Feature"),
                  alt.Tooltip("several_values:Q", title="Species with >1 Value"),
                  alt.Tooltip("share:Q", title="Share", format=".1%")]), width="stretch")
     
-    st.write("Some are different situations (newborn vs adult, male vs female) or updated assessments, "
-             "but the download doesn't include that context, so we can't tell which value is right.")
 
     st.subheader("VELOCITY: Update the dataset")
     
@@ -490,13 +514,12 @@ with tab2:
     
     downloads = data["downloads"]
     class_names = sorted(downloads["class"].unique())
-    chosen_classes = st.multiselect("Classes", class_names, default=["Mammalia"] if "Mammalia" in class_names else [],
-                                    key="velocity_classes")
+    chosen_classes = st.multiselect("Classes", class_names, default=class_names[:1], key="velocity_classes")
     
     if st.button("Refresh from Wikidata", disabled=not chosen_classes):
         picked = downloads[downloads["class"].isin(chosen_classes)]
         with st.spinner("Asking Wikidata..."):
-            st.session_state["velocity"] = (chosen_classes, *refresh_classes(sorted(set(picked["class_id"])),
+            st.session_state["velocity"] = (chosen_classes, *refresh_classes(sorted(set(picked["root_id"])),
                                                                              picked["file"].tolist()))
     
     if "velocity" in st.session_state:
