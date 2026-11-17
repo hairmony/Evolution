@@ -78,6 +78,7 @@ def make_map(names):
         pairs += [F.lit(code), F.lit(name)]
     return F.create_map(pairs)
 
+
 # Data loading/cleaning
 
 @st.cache_data
