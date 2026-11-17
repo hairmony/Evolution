@@ -52,4 +52,18 @@ The data must be in `C:\bigdata\data` and `C:\bigdata\features` on every device.
    python -m streamlit run app.py
    ```
 
-   Running the app will take a while the first time since it loads and organizes a large dataset.
+   Running the app will take a while the first time since it loads and organizes a large dataset##.
+
+## Screenshots
+
+![Homepage](screenshots/tol-home.png)
+
+![Tree of Life - Cat](screenshots/tol-cat.png)
+
+![Volume graph](screenshots/data-volume.png)
+
+![Variety graph](screenshots/data-variety.png)
+
+![Veracity graph](screenshots/data-veracity.png)
+
+![Velocity function](screenshots/data-velocity.png)
